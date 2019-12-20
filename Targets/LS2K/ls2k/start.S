@@ -69,6 +69,10 @@
 /*
  * Coprocessor 0 register names
  */
+
+// 协处理器0寄存器名称
+// 这些定义为什么会出现在这里？
+
 #define CP0_INDEX $0
 #define CP0_RANDOM $1
 #define CP0_ENTRYLO0 $2
@@ -161,6 +165,10 @@ _start:
 start:
 	.globl	stack
 stack = start - 0x4000		/* Place PMON stack below PMON start in RAM */
+// 0x4000 = 16K
+// 是不是芯片启动时会读一段程序到SRAM？
+// 然后程序就把当前位置认为是SRAM范围内，把它当作SRAM来使用
+// 芯片启动之后，可用的SRAM范围是多少
 
 #if 1 //fix the hardware poweroff error.
 
@@ -202,6 +210,8 @@ stack = start - 0x4000		/* Place PMON stack below PMON start in RAM */
 
 	/* init processor state at first*/
 /* NOTE!! Not more that 16 instructions here!!! Right now it's FULL! */
+// 这里最多塞16个指令，现在已经塞满了
+// 注意，汇编伪指命有可能编译成多条指令，例如：立即数加载
 	mtc0	zero, COP_0_STATUS_REG //cuckoo
 	mtc0	zero, COP_0_CAUSE_REG
 	li	t0, SR_BOOT_EXC_VEC	/* Exception to Boostrap Location */
@@ -212,17 +222,26 @@ stack = start - 0x4000		/* Place PMON stack below PMON start in RAM */
 
 	.set	mips32
 	mfc0	t0, $16, 6		#Store fill
+// [PRA] Available for implementation-dependent user
+// 这很可能是龙芯自己定义的协处理器号码
+// [龙芯GS264处理器用户手册 P.109]
+// STFill 8 1-开启 0-关闭 初始值 1-开启
+
 	.set	mips3
 	li	t1, 0xfffffeff
 	and	t0, t1, t0
+// 把 STFill 这个位弄清零
 	.set	mips32
 	mtc0	t0, $16, 6		#Store fill
+// 写回 STFill 位禁止 STFill
+
 	.set	mips3
 
 	/* spi speedup */
 	li  t0, 0xbfff0220
 	li  t1, 0x47
 	sb  t1, 0x4(t0)
+// 这个真看不懂
 
 	bal	locate			/* Get current execute address */
 	nop
@@ -395,8 +414,42 @@ initregs:
 
         mfc0    t0, CP0_STATUS
         li	t1, 0x64000000|SR_KX|SR_SX|SR_UX|SR_BOOT_EXC_VEC
+//                  0110 0100
+// [MIPS64PRA P.193]
+// CU3 CU2 CU1 CU0 0110 协处理器寄存器访问允许控制位
+// RP-0 : Reduced power mode on some implementations.(Optional)
+// FR-1 : This bit is used to control the floating point register mode for
+//        64-bit floating point units
+//         0 Floating point registers can contain any 32-bit datatype.
+//           64-bit datatypes are stored in even-odd pairs of registers.
+//         1 Floating point registers can contain any datatype.
+//         (详见194页)
+// RE-0 : Used to enable reverse-endian memory references while the processor
+//        is running in user mode:
+//         0 User mode uses configured endianness
+//         1 User mode uses reversed endianness
+//        Neither Debug Mode nor Kernel Mode nor Supervisor Mode references
+//        are affected by the statue of this bit.
+//        If this bit is not implemented, it must be ignored on write and
+//        read as zero.
+
+// MX-0
+// KX 7: * Access to 64-bit Kernel Segments
+//       * Use of the XTLB Refill sector for references to Kernel Segments
+// SX 6: * Access to 64-bit Supervisor Segments
+//       * Use of the XTLB Refill sector for references to Supervisor Segments
+// UX 5: * Access to 64-bit User Segments
+//       * Use of the XTLB Refill sector for references to User Segments
+//       * Execution of instructions which perform 64-bit operations while
+//         the processor is operating in User Mode
+// #define SR_BOOT_EXC_VEC               0x00400000
+// 这个对应的位是 (1<<22)
+// BEV 22: Control the location of exception vectors: 0-Normal 1-Bootstrap(默认)
         or      t0, t0, t1
         mtc0    t0, CP0_STATUS
+// 把上面所述各位置1之后写回 CP0_STATUS 寄存器
+// [PRA] 9.30 Status Register (CP Register 12, Select 0)
+
 	la	sp, stack
 	la	gp, _gp
 	jr	ra
@@ -406,6 +459,9 @@ initregs:
  *  We get here from executing a bal to get the PC value of the current execute
  *  location into ra. Check to see if we run from ROM or if this is ramloaded.
  */
+// 他们～他们觉得这样就能判断从ROM或者是从RAM运行
+// too simple, sometimes navie
+// 程序放错地方，也会被判断成RAM里面运行吗
 locate:
 
 	la	s0, start
@@ -414,9 +470,17 @@ locate:
 
 	mfc0    t0, CP0_STATUS
 	li	t1, 0x64000000|SR_KX|SR_SX|SR_UX|SR_BOOT_EXC_VEC      # {cu3,cu2,cu1,cu0}<={0110, status_fr<=1,0xe0 to enable 64bit space
+// KX 7 Enables the following behavior:
+//      o Access to 64-bit Kernel Segments
+//      o Use of the XTLB Refill Sector for references to Kernel Segments
+//      Encoding      Meaning
+//       0        Access to 64-bit Kernel Segments is disabled; TLB Refill Vector is used for references to Kernel Segments
+//       1        Access to 64-bit Kernel Segments is enabled; XTLB Refill Sector is used for references to Kernel Segments
+//       If 64-bit addressing is not implemented, this bit must be ignored on write and read as zero.
 	or	t0, t0, t1
 	mtc0	t0, CP0_STATUS
 	mtc0	zero, COP_0_CAUSE_REG
+// 清零 Cause 寄存器
 
 cp0_main:
         .set    mips32
