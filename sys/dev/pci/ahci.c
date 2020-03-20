@@ -76,11 +76,16 @@
 #if defined(LOONGSON_2G1A) || defined(LOONGSON_2F1A)
 #include "include/ls1a.h"
 #endif
-struct ahci_probe_ent *probe_ent = NULL;
-unsigned int probe_ent_array[4];
 
-static int ahci_host_init(struct ahci_probe_ent *probe_ent);
-static int ahci_init_one(u32 regbase);
+/* Maximum timeouts for each event */
+#define WAIT_MS_SPINUP	20000
+#define WAIT_MS_DATAIO	10000
+#define WAIT_MS_FLUSH	5000
+#define WAIT_MS_LINKUP	200
+#define debug printf
+
+int ahci_host_init(struct ahci_probe_ent *probe_ent);
+static void *ahci_init_one(u32 regbase);
 
 static int ahci_match(struct device *, void *, void *);
 static void ahci_attach(struct device *, struct device *, void *);
@@ -112,7 +117,8 @@ static int ahci_match(struct device *parent, void *match, void *aux)
 	struct pci_attach_args *pa = aux;
 
 	if((PCI_VENDOR(pa->pa_id) == PCI_VENDOR_SATA && PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_SATA) ||
-		(PCI_VENDOR(pa->pa_id) == PCI_VENDOR_2KSATA && PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_2KSATA))
+		(PCI_VENDOR(pa->pa_id) == PCI_VENDOR_2KSATA && PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_2KSATA) ||
+		(pa->pa_class >> 8) == 0x010601)
 		return 1;
 
 	return 0;
@@ -128,6 +134,7 @@ static void ahci_attach(struct device *parent, struct device *self, void *aux)
 	int i;
 	u32 linkmap;
 	ahci_sata_info_t info;
+	struct ahci_probe_ent *probe_ent;
 
 	if((PCI_VENDOR(pa->pa_id) == PCI_VENDOR_2KSATA && PCI_PRODUCT(pa->pa_id) == PCI_PRODUCT_2KSATA))
 	{
@@ -152,19 +159,19 @@ static void ahci_attach(struct device *parent, struct device *self, void *aux)
 	printf("0x12C =%x\n", temp);
 #endif
 
-	if (ahci_init_one((u32) (memt->bus_base | (u32) (membasep)))) {
+	if (!(probe_ent = ahci_init_one((u32) (memt->bus_base | (u32) (membasep))))) {
 		printf("ahci_init_one failed.\n");
 	}
-	probe_ent_array[atoi(&self->dv_xname[4])] = probe_ent;
 
 	linkmap = probe_ent->link_port_map;
 	printf("ahci: linkmap=%x\n", linkmap);
-	for (i = 0; i < 1; i++) {
+	for (i = 0; i < probe_ent->n_ports; i++) {
 		if (((linkmap >> i) & 0x01)) {
 			info.sata_reg_base =
-			    memt->bus_base | (u32) (membasep) + 100 + i * 0x80;
+			    memt->bus_base | (u32) (membasep) + 0x100 + i * 0x80;
 			info.flags = i;
 			info.aa_link.aa_type = 0xff;	/* just for not match ide */
+			info.probe_ent = probe_ent;
 			config_found(self, (void *)&info, NULL);
 		}
 	}
@@ -183,15 +190,15 @@ static void lahci_attach(struct device *parent, struct device *self, void *aux)
 	int i;
 	u32 linkmap;
 	ahci_sata_info_t info;
+	struct ahci_probe_ent *probe_ent;
 #if defined(LOONGSON_2G1A) || defined(LOONGSON_2F1A)
 	*(volatile int *)LS1A_SATA_CLK_REG  = 0x38682650; //100MHZ
 #endif
 	regbase = (bus_space_handle_t) cf->ca_baseaddr;;
 	printf("%s:%d: regbase = %08x\n", __FUNCTION__, __LINE__, regbase);
-	if (ahci_init_one(regbase)) {
+	if (!(probe_ent = ahci_init_one(regbase))) {
 		printf("ahci_init_one failed.\n");
 	}
-	probe_ent_array[atoi(&self->dv_xname[4])] = probe_ent;
 
 
 	linkmap = probe_ent->link_port_map;
@@ -237,56 +244,108 @@ static void ahci_enable_ahci(void *mmio)
 	}
 }
 
-static int ahci_host_init(struct ahci_probe_ent *probe_ent)
+int  ahci_link_up(struct ahci_probe_ent *probe_ent, u8 port)
 {
-	volatile u8 *mmio = (volatile u8 *)probe_ent->mmio_base;
-	u32 tmp, cap_save;
-	int i, j;
-	volatile u8 *port_mmio;
-
-	cap_save = readl(mmio + HOST_CAP);
-	cap_save &= ((1 << 28) | (1 << 17));
-	cap_save |= (1 << 27);
+	u32 tmp;
+	int j = 0;
+	void *port_mmio = probe_ent->port[port].port_mmio;
 
 	/*
-	 * Make sure AHCI mode is enabled before accessing CAP
-	 * */
-	ahci_enable_ahci(mmio);
-
-	/* global controller reset */
-	tmp = readl(mmio + HOST_CTL);
-	if ((tmp & HOST_RESET) == 0) {
-		printf("Global controller reset.\n");
-		writel_with_flush(tmp | HOST_RESET, mmio + HOST_CTL);
+	 * Bring up SATA link.
+	 * SATA link bringup time is usually less than 1 ms; only very
+	 * rarely has it taken between 1-2 ms. Never seen it above 2 ms.
+	 */
+	while (j < WAIT_MS_LINKUP) {
+		tmp = readl(port_mmio + PORT_SCR_STAT);
+		tmp &= PORT_SCR_STAT_DET_MASK;
+		if (tmp == PORT_SCR_STAT_DET_PHYRDY)
+			return 0;
+		udelay(1000);
+		j++;
 	}
+	return 1;
+}
 
-	/* reset must complete within 1 second, or
+int ahci_reset(void  *base)
+{
+	int i = 1000;
+	u32 *host_ctl_reg = base + HOST_CTL;
+	u32 tmp = readl(host_ctl_reg); /* global controller reset */
+
+	if ((tmp & HOST_RESET) == 0)
+		writel_with_flush(tmp | HOST_RESET, host_ctl_reg);
+
+	/*
+	 * reset must complete within 1 second, or
 	 * the hardware should be considered fried.
 	 */
-	ssleep(1);
+	do {
+		udelay(1000);
+		tmp = readl(host_ctl_reg);
+		i--;
+	} while ((i > 0) && (tmp & HOST_RESET));
 
-	tmp = readl(mmio + HOST_CTL);
-	if (tmp & HOST_RESET) {
+	if (i == 0) {
 		printf("controller reset failed (0x%x)\n", tmp);
 		return -1;
 	}
 
+	return 0;
+}
+
+/* 
+   ahci_enable_ahci after ahci_reset.
+   disable ahci interrupt, interrupt may cause pcie stuck.
+*/
+
+int ahci_host_init(struct ahci_probe_ent *probe_ent)
+{
+	volatile u8 *mmio = (volatile u8 *)probe_ent->mmio_base;
+	u32 tmp, cap_save, cmd;
+	int i, j, ret;
+	void  *port_mmio;
+	u32 port_map;
+
+	debug("ahci_host_init: start\n");
+
+	cap_save = readl(mmio + HOST_CAP);
+	cap_save &= ((1 << 28) | (1 << 17));
+	cap_save |= (1 << 27);  /* Staggered Spin-up. Not needed. */
+
+	ret = ahci_reset(probe_ent->mmio_base);
+	if (ret)
+		return ret;
+
+	writel_with_flush(HOST_AHCI_EN, mmio + HOST_CTL);
 	writel(cap_save, mmio + HOST_CAP);
 	writel_with_flush(0xf, mmio + HOST_PORTS_IMPL);
 
 	probe_ent->cap = readl(mmio + HOST_CAP);
 	probe_ent->port_map = readl(mmio + HOST_PORTS_IMPL);
+	port_map = probe_ent->port_map;
+#ifndef AHCI_PORT
 	probe_ent->n_ports = (probe_ent->cap & 0x1f) + 1;
+	i = 0;
+#else
+	i= AHCI_PORT;
+	probe_ent->n_ports = AHCI_PORT + 1;
+#endif
 
-	for (i = 0; i < probe_ent->n_ports; i++) {
-		probe_ent->port[i].port_mmio = ahci_port_base((u32) mmio, i);
-		port_mmio = (u8 *) probe_ent->port[i].port_mmio;
-		ahci_setup_port(&probe_ent->port[i], (unsigned long)mmio, i);
+	debug("cap 0x%x  port_map 0x%x  n_ports %d\n",
+	      probe_ent->cap, probe_ent->port_map, probe_ent->n_ports);
+
+
+	for (; i < probe_ent->n_ports; i++) {
+		if (!(port_map & (1 << i)))
+			continue;
+		probe_ent->port[i].port_mmio = ahci_port_base(mmio, i);
+		port_mmio = (u8 *)probe_ent->port[i].port_mmio;
 
 		/* make sure port is not active */
 		tmp = readl(port_mmio + PORT_CMD);
 		if (tmp & (PORT_CMD_LIST_ON | PORT_CMD_FIS_ON |
 			   PORT_CMD_FIS_RX | PORT_CMD_START)) {
+			debug("Port %d is active. Deactivating.\n", i);
 			tmp &= ~(PORT_CMD_LIST_ON | PORT_CMD_FIS_ON |
 				 PORT_CMD_FIS_RX | PORT_CMD_START);
 			writel_with_flush(tmp, port_mmio + PORT_CMD);
@@ -297,52 +356,80 @@ static int ahci_host_init(struct ahci_probe_ent *probe_ent)
 			msleep(500);
 		}
 
-		tmp = readl(port_mmio + PORT_SCR);
-		if ((tmp & 0x3)) {
-			tmp &= ~0x3;
-			writel_with_flush(tmp, port_mmio + PORT_SCR);
-			msleep(500);
+
+		/* Add the spinup command to whatever mode bits may
+		 * already be on in the command register.
+		 */
+		cmd = readl(port_mmio + PORT_CMD);
+		cmd |= PORT_CMD_SPIN_UP;
+		writel_with_flush(cmd, port_mmio + PORT_CMD);
+
+		/* Bring up SATA link. */
+		ret = ahci_link_up(probe_ent, i);
+		if (ret) {
+			printf("SATA link %d timeout.\n", i);
+			continue;
+		} else {
+			debug("SATA link ok.\n");
 		}
 
-		writel(PORT_CMD_SPIN_UP, port_mmio + PORT_CMD);
+		/* Clear error status */
+		tmp = readl(port_mmio + PORT_SCR_ERR);
+		if (tmp)
+			writel(tmp, port_mmio + PORT_SCR_ERR);
+
+		debug("Spinning up device on SATA port %d... ", i);
 
 		j = 0;
-		while (j < 100) {
-			msleep(10);
+		while (j < WAIT_MS_SPINUP) {
+			tmp = readl(port_mmio + PORT_TFDATA);
+			if (!(tmp & (ATA_BUSY | ATA_DRQ)))
+				break;
+			udelay(1000);
 			tmp = readl(port_mmio + PORT_SCR_STAT);
-			if ((tmp & 0xf) == 0x3)
+			tmp &= PORT_SCR_STAT_DET_MASK;
+			if (tmp == PORT_SCR_STAT_DET_PHYRDY)
 				break;
 			j++;
 		}
 
+		tmp = readl(port_mmio + PORT_SCR_STAT) & PORT_SCR_STAT_DET_MASK;
+		if (tmp == PORT_SCR_STAT_DET_COMINIT) {
+			debug("SATA link %d down (COMINIT received), retrying...\n", i);
+			i--;
+			continue;
+		}
+
+		printf("Target spinup took %d ms.\n", j);
+		if (j == WAIT_MS_SPINUP)
+			debug("timeout.\n");
+		else
+			debug("ok.\n");
+
 		tmp = readl(port_mmio + PORT_SCR_ERR);
-		printf("PORT_SCR_ERR 0x%x\n", tmp);
+		debug("PORT_SCR_ERR 0x%x\n", tmp);
 		writel(tmp, port_mmio + PORT_SCR_ERR);
 
 		/* ack any pending irq events for this port */
 		tmp = readl(port_mmio + PORT_IRQ_STAT);
-		printf("PORT_IRQ_STAT 0x%x\n", tmp);
+		debug("PORT_IRQ_STAT 0x%x\n", tmp);
 		if (tmp)
 			writel(tmp, port_mmio + PORT_IRQ_STAT);
 
 		writel(1 << i, mmio + HOST_IRQ_STAT);
 
-		/* set irq mask (enables interrupts) */
-		writel(DEF_PORT_IRQ, port_mmio + PORT_IRQ_MASK);
-
-		/*register linkup ports */
+		/* register linkup ports */
 		tmp = readl(port_mmio + PORT_SCR_STAT);
-		printf("Port %d status: 0x%x\n", i, tmp);
-		if ((tmp & 0xf) == 0x03)
+		debug("SATA port %d status: 0x%x\n", i, tmp);
+		if ((tmp & PORT_SCR_STAT_DET_MASK) == PORT_SCR_STAT_DET_PHYRDY)
 			probe_ent->link_port_map |= (0x01 << i);
 	}
 
 	tmp = readl(mmio + HOST_CTL);
-	printf("HOST_CTL 0x%x\n", tmp);
+	debug("HOST_CTL 0x%x\n", tmp);
 	writel(tmp | HOST_IRQ_EN, mmio + HOST_CTL);
 	tmp = readl(mmio + HOST_CTL);
-	printf("HOST_CTL 0x%x\n", tmp);
-
+	debug("HOST_CTL 0x%x\n", tmp);
 	return 0;
 }
 
@@ -392,9 +479,10 @@ static void ahci_print_info(struct ahci_probe_ent *probe_ent)
 	       cap & (1 << 14) ? "slum " : "", cap & (1 << 13) ? "part " : "");
 }
 
-static int ahci_init_one(u32 regbase)
+static void *ahci_init_one(u32 regbase)
 {
 	int rc;
+	struct ahci_probe_ent *probe_ent;
 
 #if MY_MALLOC
 	probe_ent = malloc(sizeof(struct ahci_probe_ent));
@@ -419,8 +507,9 @@ static int ahci_init_one(u32 regbase)
 
 	ahci_print_info(probe_ent);
 
-	return 0;
+	return probe_ent;
 
 err_out:
-	return rc;
+	free(probe_ent, M_DEVBUF);
+	return NULL;
 }
