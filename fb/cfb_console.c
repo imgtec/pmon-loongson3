@@ -106,6 +106,7 @@ CONFIG_VIDEO_HW_CURSOR:	     - Uses the hardware cursor capability of the
 //#include <target/types.h>
 #include "mod_sisfb.h"
 #include <dev/pci/pcivar.h>
+#include "mod_x86emu_int10.h"
 
 #ifdef RADEON7000
 //#define VIDEO_FB_LITTLE_ENDIAN
@@ -287,7 +288,7 @@ void	console_cursor (int state);
 #define CONSOLE_ROW_SIZE	(VIDEO_FONT_HEIGHT * VIDEO_LINE_LEN)
 #define CONSOLE_ROW_FIRST	(video_console_address)
 #define CONSOLE_ROW_SECOND	(video_console_address + CONSOLE_ROW_SIZE)
-#define CONSOLE_ROW_LAST	(video_console_address + CONSOLE_SIZE - CONSOLE_ROW_SIZE)
+#define CONSOLE_ROW_LAST	(video_console_address + (CONSOLE_ROWS-1)*CONSOLE_ROW_SIZE)
 //#define CONSOLE_SIZE		(CONSOLE_ROW_SIZE * CONSOLE_ROWS)
 #ifdef CONFIG_VIDEO_LOGO
 #define CONSOLE_SIZE		(VIDEO_COLS * (VIDEO_ROWS - VIDEO_LOGO_HEIGHT) * VIDEO_PIXEL_SIZE)
@@ -861,7 +862,7 @@ void sisfb_copyarea(int sx,int sy,int dx,int dy,int width,int height);
 #else
 
 #if defined(MEM_PRINTTO_VIDEO)
-	if (CONSOLE_ROWS != 0)
+	if (CONSOLE_ROWS > 1)
 		video_drawsline(memfb, CONSOLE_ROWS, CONSOLE_COLS);
 #else
 
@@ -903,12 +904,10 @@ void sisfb_copyarea(int sx,int sy,int dx,int dy,int width,int height);
 
 #endif
 
-#elif X800x600
-	memsetl (CONSOLE_ROW_LAST - CONSOLE_ROW_SIZE/2, CONSOLE_ROW_SIZE >> 2, CONSOLE_BG_COL);
 #elif X1368x768
 	memsetl (CONSOLE_ROW_LAST, CONSOLE_ROW_SIZE >> 2, CONSOLE_BG_COL);
 #else
-	memsetl (CONSOLE_ROW_LAST - CONSOLE_ROW_SIZE/2, CONSOLE_ROW_SIZE >> 2, CONSOLE_BG_COL);
+	memsetl (CONSOLE_ROW_LAST, CONSOLE_ROW_SIZE >> 2, CONSOLE_BG_COL);
 #endif
 }
 
@@ -1462,7 +1461,7 @@ void video_set_background(unsigned char r, unsigned char g, unsigned char b)
 		cnt -= 2;		
 	}
 }
-static int record = 1;
+static int record = 0;
 //80*24
 #if defined(X640x480)
 char console_buffer[2][31][81]={32};//80*30->640x480
@@ -1478,6 +1477,8 @@ char console_buffer[2][65][161]={32};//128*48->1024x768
 char console_buffer[2][49][172]={32};//128*48->1024x768
 #elif defined(X320x240)
 char console_buffer[2][16][41]={32};//40*15->320x240
+#elif defined(FB_XSIZE) && defined(FB_YSIZE)
+char console_buffer[2][FB_YSIZE/8+1][FB_XSIZE/16+1]={32};
 #else
 char console_buffer[2][31][81]={32};//80*30->640x480
 #endif
@@ -1563,6 +1564,7 @@ void video_set_color(unsigned char color)
 #endif
 static void __cprint(int y, int x,int width,char color, const char *buf)
 {
+	begin_record();
 #ifndef FB_MENU_NOCLOLOR
 	bgx = pallete[color>>4];
 	bgx |= (bgx << 16);
@@ -1646,8 +1648,8 @@ int fb_init (unsigned long fbbase,unsigned long iobase)
 #elif defined(X320x240)
         pGD->winSizeX  = 320;
         pGD->winSizeY  = 240;
-#else
-#if !defined(FB_XSIZE)
+#elif NMOD_X86EMU_INT10 && (!defined(FB_XSIZE) || !defined(FB_YSIZE))
+#if !defined(FB_XSIZE) 
 #define FB_XSIZE 800
 #endif
 #if !defined(FB_YSIZE)
@@ -1655,6 +1657,9 @@ int fb_init (unsigned long fbbase,unsigned long iobase)
 #endif
         pGD->winSizeX  = ScreenLineLength/((ScreenDepth+1)/8);
         pGD->winSizeY  = ScreenHeight;
+#else
+        pGD->winSizeX  = FB_XSIZE;
+        pGD->winSizeY  = FB_YSIZE;
 #endif
 
 #if   defined(CONFIG_VIDEO_1BPP)
