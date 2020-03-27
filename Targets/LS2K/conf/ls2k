@@ -266,3 +266,4 @@ select		tcp
 select		inet
 select		nand
 select cmd_xyzmodem
+option HPET_RTC
